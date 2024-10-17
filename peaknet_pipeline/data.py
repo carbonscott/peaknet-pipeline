@@ -1,62 +1,58 @@
 import torch
-import logging
-import time
-from psana_ray.data_reader import DataReader, DataReaderError
 from torch.utils.data import IterableDataset
+from psana_ray.data_reader import DataReader, DataReaderError
+import logging
+from typing import Optional
 
 class QueueDataset(IterableDataset):
-    def __init__(self, queue_name="shared_queue", ray_namespace='my'):
+    def __init__(self, queue_name: str = "shared_queue", ray_namespace: str = 'my'):
         super().__init__()
-        self.worker_readers = {}
         self.queue_name = queue_name
         self.ray_namespace = ray_namespace
+        self.reader: Optional[DataReader] = None
+        logging.info(f"QueueDataset initialized with queue_name={queue_name}, ray_namespace={ray_namespace}")
 
     def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:  # single-process data loading
-            worker_id = 0
-            num_workers = 1
-        else:  # in a worker process
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
-
-        if worker_id not in self.worker_readers:
-            self.worker_readers[worker_id] = DataReader(queue_name=self.queue_name, ray_namespace=self.ray_namespace)
-            self.worker_readers[worker_id].connect()
-            logging.debug(f"Worker {worker_id}: Created and connected new DataReader")
-
-        return self.data_iterator(worker_id, num_workers)
-
-    def data_iterator(self, worker_id, num_workers):
-        reader = self.worker_readers[worker_id]
-        while True:
+        if self.reader is None:
             try:
-                data = reader.read()
-                if data is None:
-                    logging.debug(f"Worker {worker_id}: No data received, sleeping...")
-                    time.sleep(0.1)  # Short sleep to avoid busy-waiting
-                    continue
-                rank, idx, image_data = data
-                if idx % num_workers == worker_id:
-                    logging.debug(f"Worker {worker_id}: Received data: rank={rank}, idx={idx}, image_shape={image_data.shape}")
-                    tensor = torch.tensor(image_data).unsqueeze(0)  # (H,W) -> (1,H,W)
-                    yield tensor
-            except DataReaderError as e:
-                logging.error(f"Worker {worker_id}: DataReader error: {e}")
-                break
+                self.reader = DataReader(queue_name=self.queue_name, ray_namespace=self.ray_namespace)
+                self.reader.connect()
+                logging.info("Created and connected new DataReader")
             except Exception as e:
-                logging.error(f"Worker {worker_id}: Unexpected error in QueueDataset: {e}")
-                time.sleep(1)  # Longer sleep on unexpected errors
+                logging.error(f"Failed to create or connect DataReader: {e}")
+                raise
+        return self
+
+    def __next__(self):
+        if self.reader is None:
+            raise RuntimeError("DataReader not initialized. Make sure to iterate over the dataset.")
+
+        try:
+            data = self.reader.read()
+            if data is None:
+                logging.debug("No data received, stopping iteration")
+                raise StopIteration
+
+            rank, idx, image_data = data
+            logging.info(f"Received data: rank={rank}, idx={idx}, image_shape={image_data.shape}")
+            tensor = torch.tensor(image_data).unsqueeze(0)
+            return tensor
+
+        except DataReaderError as e:
+            logging.error(f"DataReader error: {e}")
+            raise StopIteration
+        except Exception as e:
+            logging.error(f"Unexpected error in QueueDataset: {e}")
+            raise
 
     def cleanup(self):
-        """Explicit cleanup method to close all DataReaders."""
-        for worker_id, reader in self.worker_readers.items():
+        if self.reader:
             try:
-                reader.close()
-                logging.debug(f"Worker {worker_id}: DataReader closed in cleanup")
+                self.reader.close()
+                logging.info("DataReader closed in cleanup")
             except Exception as e:
-                logging.error(f"Worker {worker_id}: Error closing DataReader in cleanup: {e}")
-        self.worker_readers.clear()
+                logging.error(f"Error closing DataReader in cleanup: {e}")
+            self.reader = None
 
     def __del__(self):
         self.cleanup()

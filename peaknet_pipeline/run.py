@@ -2,7 +2,6 @@ import os
 import sys
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 import yaml
 import argparse
@@ -19,6 +18,7 @@ from .mpi_utils import init_dist_env
 from .data import QueueDataset
 from .pipeline import InferencePipeline
 
+import torch.multiprocessing as mp
 from mpi4py import MPI
 
 import ray
@@ -69,23 +69,9 @@ def load_model(config_path, weights_path):
 def run_inference(args):
     # Enable distributed env
     init_dist_env()
-    uses_dist = int(os.environ.get("WORLD_SIZE", 1)) > 1
-    if uses_dist:
-        dist_rank       = int(os.environ["RANK"])
-        dist_local_rank = int(os.environ["LOCAL_RANK"])
-        dist_world_size = int(os.environ["WORLD_SIZE"])
-        dist_backend    = args.dist_backend
-        dist.init_process_group(backend     = dist_backend,
-                                rank        = dist_rank,
-                                world_size  = dist_world_size,
-                                timeout     = timedelta(seconds = 1800),
-                                init_method = "env://",)
-        logging.info(f"RANK:{dist_rank},LOCAL_RANK:{dist_local_rank},WORLD_SIZE:{dist_world_size}")
-    else:
-        dist_rank       = 0
-        dist_local_rank = 0
-        dist_world_size = 1
-        logging.info(f"NO distributed environment is required. RANK:{dist_rank},LOCAL_RANK:{dist_local_rank},WORLD_SIZE:{dist_world_size}")
+    dist_rank       = int(os.environ["RANK"])
+    dist_local_rank = int(os.environ["LOCAL_RANK"])
+    dist_world_size = int(os.environ["WORLD_SIZE"])
 
     # Set up the device
     device = torch.device(f"cuda:{dist_local_rank}")
@@ -101,22 +87,20 @@ def run_inference(args):
 
         if dist_rank == 0:
             # Queue does not exist; create it
-            peak_positions_queue = create_queue(queue_name=args.peak_positions_queue_name,
+            peak_positions_queue = create_queue(queue_name=args.output_queue_name,
                                                 ray_namespace=args.ray_namespace,
-                                                maxsize=args.peak_positions_queue_size)
-            logging.info(f"Created peak_positions_queue_name: {args.peak_positions_queue_name} in namespace: {args.ray_namespace}")
+                                                maxsize=args.output_queue_size)
+            logging.info(f"Created output_queue_name: {args.output_queue_name} in namespace: {args.ray_namespace}")
         # Synchronize all ranks to ensure the queue is created before others try to connect
         comm.Barrier()
 
         # Non-zero ranks connect to the existing peak_positions_queue
-        peak_positions_queue = ray.get_actor(args.peak_positions_queue_name, namespace=args.ray_namespace)
-        logging.info(f"Connected to peak_positions_queue_name: {args.peak_positions_queue_name} in namespace: {args.ray_namespace}")
+        peak_positions_queue = ray.get_actor(args.output_queue_name, namespace=args.ray_namespace)
+        logging.info(f"Connected to output_queue_name: {args.output_queue_name} in namespace: {args.ray_namespace}")
 
         # Initialize the PeakNetInference
         model = load_model(args.config_path, args.weights_path)
         model.to(device)
-        if uses_dist:
-            model = DDP(model, device_ids=[dist_local_rank])
 
         # Set up the data reader and dataset
         dataset = QueueDataset(queue_name=args.input_queue_name, ray_namespace=args.ray_namespace)
@@ -147,7 +131,8 @@ def run_inference(args):
         base_delay = 0.1  # Base delay of 100ms
         max_delay = 2.0   # Maximum delay of 2 seconds
         max_retries = sys.maxsize
-        for batch_idx, batch in enumerate(dataloader):
+        batch_idx = 0
+        for batch in dataloader:
             if batch.numel() == 0:
                 logging.warning("Received empty batch, skipping")
                 continue
@@ -160,7 +145,7 @@ def run_inference(args):
             accumulated_results.extend(batch_results)
 
             # Push accumulated results to the new queue when we reach the accumulation step
-            if (batch_idx + 1) % args.accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+            if (batch_idx + 1) % args.accumulation_steps == 0:
                 retries = 0
                 while True:
                     success = ray.get(peak_positions_queue.put.remote(accumulated_results))
@@ -180,6 +165,26 @@ def run_inference(args):
                         logging.warning(f"Rank {dist_local_rank}, Device {device}: Queue is full, retrying in {total_delay:.2f} seconds...")
                         time.sleep(total_delay)
                         retries += 1
+            batch_idx += 1
+
+        if accumulated_results:
+            retries = 0
+            while retries < max_retries:
+                try:
+                    success = ray.get(peak_positions_queue.put.remote(accumulated_results), timeout=5)
+                    if success:
+                        logging.info(f"Rank {dist_local_rank}, Device {device}: Pushed final accumulated results to queue")
+                        break
+                    else:
+                        logging.warning(f"Rank {dist_local_rank}, Device {device}: Failed to push final results, retrying...")
+                except ray.exceptions.GetTimeoutError:
+                    logging.warning(f"Rank {dist_local_rank}, Device {device}: Timeout while pushing final results, retrying...")
+
+                retries += 1
+                time.sleep(min(max_delay, base_delay * (2 ** retries)))
+
+            if retries == max_retries:
+                logging.error(f"Rank {dist_local_rank}, Device {device}: Failed to push final accumulated results after max retries.")
 
         # Signal end of data
         if dist_rank == 0:
@@ -194,8 +199,7 @@ def run_inference(args):
         logging.error(traceback.format_exc())
     finally:
         if dataset is not None: dataset.cleanup()
-        if uses_dist:
-            dist.destroy_process_group()
+        dist.destroy_process_group()
         ray.shutdown()
         MPI.Finalize()
         logging.info("Inference completed or terminated. Exiting...")
@@ -215,9 +219,9 @@ def main():
                         help="Logging level")
 
     # New arguments for second queue
-    parser.add_argument("--peak_positions_queue_name", type=str, default="peak_positions_queue",
+    parser.add_argument("--output_queue_name", type=str, default="peak_positions_queue",
                         help="Name of the Ray queue to push peak positions")
-    parser.add_argument("--peak_positions_queue_size", type=int, default=1000,
+    parser.add_argument("--output_queue_size", type=int, default=1000,
                         help="Maximum size for the peak_positions_queue")
 
     # Arguments for the first queue
@@ -233,6 +237,9 @@ def main():
 
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format='%(asctime)s - %(levelname)s - %(message)s')
+
+    # Use 'spawn' to start fresh worker processes and avoid inheriting parent state, preventing conflicts with MPI and Ray.
+    mp.set_start_method('spawn', force=True)
 
     run_inference(args)
 
