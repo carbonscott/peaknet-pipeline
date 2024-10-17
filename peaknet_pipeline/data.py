@@ -5,9 +5,11 @@ from psana_ray.data_reader import DataReader, DataReaderError
 from torch.utils.data import IterableDataset
 
 class QueueDataset(IterableDataset):
-    def __init__(self):
+    def __init__(self, queue_name="shared_queue", ray_namespace='my'):
         super().__init__()
         self.worker_readers = {}
+        self.queue_name = queue_name
+        self.ray_namespace = ray_namespace
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -19,7 +21,7 @@ class QueueDataset(IterableDataset):
             num_workers = worker_info.num_workers
 
         if worker_id not in self.worker_readers:
-            self.worker_readers[worker_id] = DataReader()
+            self.worker_readers[worker_id] = DataReader(queue_name=self.queue_name, ray_namespace=self.ray_namespace)
             self.worker_readers[worker_id].connect()
             logging.debug(f"Worker {worker_id}: Created and connected new DataReader")
 
