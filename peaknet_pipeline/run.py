@@ -1,12 +1,10 @@
 import os
 import sys
 import torch
-import torch.distributed as dist
 from torch.utils.data import DataLoader
 import yaml
 import argparse
 import logging
-from datetime import timedelta
 
 from psana_ray.data_reader import DataReader
 from psana_ray.shared_queue import create_queue
@@ -199,7 +197,6 @@ def run_inference(args):
         logging.error(traceback.format_exc())
     finally:
         if dataset is not None: dataset.cleanup()
-        dist.destroy_process_group()
         ray.shutdown()
         MPI.Finalize()
         logging.info("Inference completed or terminated. Exiting...")
