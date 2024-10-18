@@ -24,6 +24,8 @@ from mpi4py import MPI
 import ray
 import traceback
 
+TERMINATION_SIGNAL = 'END'
+
 def load_model(config_path, weights_path):
     # Load configuration
     with open(config_path, 'r') as f:
@@ -183,7 +185,7 @@ def run_inference(args):
 
         # Signal end of data
         if dist_rank == 0:
-            ray.get(peak_positions_queue.put.remote(None))
+            ray.get(peak_positions_queue.put.remote(TERMINATION_SIGNAL))
             logging.info("Sent end-of-data signal to peak results queue")
 
     except KeyboardInterrupt:

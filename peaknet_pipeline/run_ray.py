@@ -22,6 +22,8 @@ import torch.multiprocessing as mp
 import ray
 import traceback
 
+TERMINATION_SIGNAL = 'END'
+
 def load_model(config_path, weights_path):
     # Load configuration
     with open(config_path, 'r') as f:
@@ -220,7 +222,7 @@ def main():
         ray.get(tasks)
 
         # Signal end of data
-        ray.get(peak_positions_queue.put.remote(None))
+        ray.get(peak_positions_queue.put.remote(TERMINATION_SIGNAL))
         logging.info("Sent end-of-data signal to peak results queue")
 
         ray.shutdown()
