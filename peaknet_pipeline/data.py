@@ -35,7 +35,8 @@ class QueueDataset(IterableDataset):
 
             rank, idx, image_data = data
             logging.info(f"Received data: rank={rank}, idx={idx}, image_shape={image_data.shape}")
-            tensor = torch.tensor(image_data).unsqueeze(0)
+            tensor = torch.tensor(image_data)
+            if tensor.ndim == 2: tensor = tensor.unsqueeze(0)
             return tensor
 
         except DataReaderError as e:

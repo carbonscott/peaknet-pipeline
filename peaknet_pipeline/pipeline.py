@@ -1,7 +1,7 @@
 import torch
 import cupy as cp
 from cupyx.scipy import ndimage
-from peaknet.tensor_transforms import Pad, InstanceNorm, PolarCenterCrop, MergeBatchPatchDims
+from peaknet.tensor_transforms import PadAndCrop, InstanceNorm, MergeBatchChannelDims
 
 class PipelineStage:
     def __init__(self, name, operation, device):
@@ -16,10 +16,12 @@ class PipelineStage:
         return self.buffer
 
 class InferencePipeline:
-    def __init__(self, model, device, mixed_precision_dtype):
+    def __init__(self, model, device, mixed_precision_dtype, H, W):
         self.model = model
         self.device = device
         self.mixed_precision_dtype = mixed_precision_dtype
+        self.H = H
+        self.W = W
         self.stages = [
             PipelineStage("data_transfer", self.data_transfer, device),
             PipelineStage("preprocess", self.preprocess, device),
@@ -40,13 +42,11 @@ class InferencePipeline:
         return batch.to(self.device, non_blocking=True)
 
     def preprocess(self, batch):
-        H_pad, W_pad = 1920, 1920  # TODO: Make these configurable
-        pad_style = 'bottom-right'
+        pad_style = 'top-left'
         transforms = (
-            Pad(H_pad, W_pad, pad_style),
-            PolarCenterCrop(Hv=1920, Wv=1920, sigma=0.1, num_crop=1),  # TODO: Make these configurable
-            MergeBatchPatchDims(),
+            PadAndCrop(self.H, self.W, pad_style),
             InstanceNorm(),
+            MergeBatchChannelDims(),
         )
         for trans in transforms:
             batch = trans(batch)
@@ -76,10 +76,3 @@ class InferencePipeline:
             data = self.stages[i].process(data)  # preprocess, inference, postprocess
         peak_positions = data
         return self.convert_to_python_lists(peak_positions)
-
-##     def run_inference(self, dataloader):
-##         all_peak_positions = []
-##         for batch in dataloader:
-##             peak_positions = self.process_batch(batch)
-##             all_peak_positions.extend(peak_positions)
-##         return all_peak_positions

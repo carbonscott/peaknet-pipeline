@@ -124,7 +124,7 @@ def run_inference(args):
         mixed_precision_dtype = dtype_map[args.dtype]
 
         # Create and run the inference pipeline
-        pipeline = InferencePipeline(model, device, mixed_precision_dtype)
+        pipeline = InferencePipeline(model, device, mixed_precision_dtype, args.H, args.W)
         pipeline.setup_autocast()
 
         logging.info("InferencePipeline created, starting inference")
@@ -208,6 +208,8 @@ def main():
     parser.add_argument("--weights_path", type=str, required=True, help="Path to the model weights file")
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"],
                         help="Data type for mixed precision")
+    parser.add_argument("--H", type=int, default=512, help="Height of the image in inference")
+    parser.add_argument("--W", type=int, default=512, help="Width of the image in inference")
     parser.add_argument("--accumulation_steps", type=int, default=10, help="Accumulation step before pushing to queue")
     parser.add_argument("--dist_backend", type=str, default="nccl", choices=["nccl", "gloo"],
                         help="Distributed backend to use")
