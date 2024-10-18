@@ -21,7 +21,8 @@ setuptools.setup(
     ],
     entry_points = {
         'console_scripts' : [
-            'peaknet-pipeline=peaknet_pipeline.run:main',
+            'peaknet-pipeline-mpi=peaknet_pipeline.run_mpi:main',
+            'peaknet-pipeline-ray=peaknet_pipeline.run_ray:main',
         ],
     },
     python_requires='>=3.6',
