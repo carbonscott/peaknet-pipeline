@@ -1,5 +1,7 @@
 import os
 import sys
+import random
+import time
 import torch
 from torch.utils.data import DataLoader
 import yaml
@@ -128,7 +130,6 @@ def run_inference(args):
         accumulated_results = []
         base_delay = 0.1  # Base delay of 100ms
         max_delay = 2.0   # Maximum delay of 2 seconds
-        max_retries = sys.maxsize
         batch_idx = 0
         for batch in dataloader:
             if batch.numel() == 0:
@@ -152,37 +153,33 @@ def run_inference(args):
                         accumulated_results = []
                         break
                     else:
-                        if retries >= max_retries:
-                            logging.error(f"Rank {dist_local_rank}, Device {device}: Max retries reached. Unable to push to queue.")
-                            break
                         # Use exponential backoff with jitter
                         delay = min(max_delay, base_delay * (2 ** retries))
                         jitter = random.uniform(0, 0.1 * delay)
                         total_delay = delay + jitter
-
                         logging.warning(f"Rank {dist_local_rank}, Device {device}: Queue is full, retrying in {total_delay:.2f} seconds...")
                         time.sleep(total_delay)
-                        retries += 1
+                        if delay < max_delay: retries += 1
             batch_idx += 1
 
         if accumulated_results:
             retries = 0
-            while retries < max_retries:
+            while True:
                 try:
                     success = ray.get(peak_positions_queue.put.remote(accumulated_results), timeout=5)
                     if success:
                         logging.info(f"Rank {dist_local_rank}, Device {device}: Pushed final accumulated results to queue")
                         break
                     else:
-                        logging.warning(f"Rank {dist_local_rank}, Device {device}: Failed to push final results, retrying...")
+                        # Use exponential backoff with jitter
+                        delay = min(max_delay, base_delay * (2 ** retries))
+                        jitter = random.uniform(0, 0.1 * delay)
+                        total_delay = delay + jitter
+                        logging.warning(f"Rank {dist_local_rank}, Device {device}: Queue is full, retrying in {total_delay:.2f} seconds...")
+                        time.sleep(total_delay)
+                        if delay < max_delay: retries += 1
                 except ray.exceptions.GetTimeoutError:
                     logging.warning(f"Rank {dist_local_rank}, Device {device}: Timeout while pushing final results, retrying...")
-
-                retries += 1
-                time.sleep(min(max_delay, base_delay * (2 ** retries)))
-
-            if retries == max_retries:
-                logging.error(f"Rank {dist_local_rank}, Device {device}: Failed to push final accumulated results after max retries.")
 
         # Signal end of data
         if dist_rank == 0:

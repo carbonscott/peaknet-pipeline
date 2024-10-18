@@ -1,5 +1,7 @@
 import os
 import sys
+import random
+import time
 import torch
 from torch.utils.data import DataLoader
 import yaml
@@ -104,7 +106,6 @@ def inference_task(args):
     base_delay = 0.1
     max_delay = 2.0
     batch_idx = 0
-
     try:
         for batch in dataloader:
             if batch.numel() == 0:
