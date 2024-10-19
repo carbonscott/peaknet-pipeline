@@ -63,14 +63,39 @@ class InferencePipeline:
         return feature_pred.softmax(dim=1).argmax(dim=1, keepdim=True)
 
     def postprocess(self, seg_maps):
-        peak_positions = []
+        """
+        Process segmentation maps to find peak positions for each batch item.
+
+        This function takes a 4D tensor of segmentation maps and processes each map
+        to find peak positions. The peaks are then grouped by batch item.
+
+        Args:
+            seg_maps (tensor): A 4D tensor of shape (BP, 1, H, W) where:
+                B is the batch size,
+                P is the number of panels per batch item,
+                H is the height of each segmentation map,
+                W is the width of each segmentation map.
+
+        Returns:
+            list of lists: A list containing B sublists, where B is the batch size.
+            Each sublist contains peak positions for a single batch item across all
+            its panels. Each peak position is represented as [p, y, x], where:
+                p is the panel index (0 to P-1),
+                y is the y-coordinate of the peak,
+                x is the x-coordinate of the peak.
+            The [p, y, x] format is required by downstream software for further processing.
+        """
+        B = seg_maps.size(0) // self.P  # BP//P
+        peak_positions = [[] for _ in range(B)]  # Initialize a list for each batch item
         for idx, seg_map in enumerate(seg_maps.flatten(0,1)):  # (BP,1,H,W)->(BP,H,W), loop over all panels
             seg_map_cp = cp.asarray(seg_map, dtype=cp.float32)
             labeled_map, num_peaks = ndimage.label(seg_map_cp, self.structure)
             peak_coords = ndimage.center_of_mass(seg_map_cp, cp.asarray(labeled_map, dtype=cp.float32), cp.arange(1, num_peaks + 1))
             if len(peak_coords) > 0:
-                # Get peak_coords -- [[B_index, P_index]+cp.array([y, x]).tolist(), ...]
-                peak_positions.append([[idx//self.P, idx%self.P]+peak.tolist() for peak in peak_coords if len(peak) > 0])
+                # Append coordinates for this segmap to the corresponding batch item
+                b = idx // self.P  # Batch index
+                p = idx % self.P   # Panel index within the batch item
+                peak_positions[b].extend([p] + peak.tolist() for peak in peak_coords if len(peak) > 0)
         return peak_positions
 
     def process_batch(self, batch):
