@@ -71,9 +71,9 @@ def load_model(config_path, weights_path):
 def run_inference(args):
     # Enable distributed env
     init_dist_env()
-    dist_rank       = int(os.environ["RANK"])
-    dist_local_rank = int(os.environ["LOCAL_RANK"])
-    dist_world_size = int(os.environ["WORLD_SIZE"])
+    dist_rank       = int(os.environ.get("RANK", 0))
+    dist_local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    dist_world_size = int(os.environ.get("WORLD_SIZE", 1))
 
     # Set up the device
     device = torch.device(f"cuda:{dist_local_rank}")

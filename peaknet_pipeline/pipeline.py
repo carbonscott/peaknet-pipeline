@@ -20,6 +20,8 @@ class InferencePipeline:
         self.model = model
         self.device = device
         self.mixed_precision_dtype = mixed_precision_dtype
+        self.B = None  # TBD
+        self.P = None  # TBD
         self.H = H
         self.W = W
         self.stages = [
@@ -42,6 +44,8 @@ class InferencePipeline:
         return batch.to(self.device, non_blocking=True)
 
     def preprocess(self, batch):
+        if self.B is None:
+            self.B, self.P, _, _ = batch.size()
         pad_style = 'top-left'
         transforms = (
             PadAndCrop(self.H, self.W, pad_style),
@@ -60,19 +64,18 @@ class InferencePipeline:
 
     def postprocess(self, seg_maps):
         peak_positions = []
-        for seg_map in seg_maps:
-            seg_map_cp = cp.asarray(seg_map[0], dtype=cp.float32)  # (C,H,W) -> (H,W)
+        for idx, seg_map in enumerate(seg_maps.flatten(0,1)):  # (BP,1,H,W)->(BP,H,W), loop over all panels
+            seg_map_cp = cp.asarray(seg_map, dtype=cp.float32)
             labeled_map, num_peaks = ndimage.label(seg_map_cp, self.structure)
             peak_coords = ndimage.center_of_mass(seg_map_cp, cp.asarray(labeled_map, dtype=cp.float32), cp.arange(1, num_peaks + 1))
-            peak_positions.append(peak_coords)
+            if len(peak_coords) > 0:
+                # Get peak_coords -- [[B_index, P_index]+cp.array([y, x]).tolist(), ...]
+                peak_positions.append([[idx//self.P, idx%self.P]+peak.tolist() for peak in peak_coords if len(peak) > 0])
         return peak_positions
-
-    def convert_to_python_lists(self, peak_positions):
-        return [[coord.tolist() for coord in image_peaks] for image_peaks in peak_positions]
 
     def process_batch(self, batch):
         data = self.stages[0].process(batch)  # data_transfer
         for i in range(1, len(self.stages)):
             data = self.stages[i].process(data)  # preprocess, inference, postprocess
         peak_positions = data
-        return self.convert_to_python_lists(peak_positions)
+        return peak_positions
