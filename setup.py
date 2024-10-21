@@ -23,6 +23,7 @@ setuptools.setup(
         'console_scripts' : [
             'peaknet-pipeline-mpi=peaknet_pipeline.run_mpi:main',
             'peaknet-pipeline-ray=peaknet_pipeline.run_ray:main',
+            'peaknet-pipeline-write-to-cxi=peaknet_pipeline.cxi_consumer:main',
         ],
     },
     python_requires='>=3.6',
