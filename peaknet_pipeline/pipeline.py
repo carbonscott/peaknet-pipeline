@@ -1,6 +1,7 @@
 import torch
 import cupy as cp
 from cupyx.scipy import ndimage
+from contextlib import nullcontext
 from peaknet.tensor_transforms import PadAndCrop, InstanceNorm, MergeBatchChannelDims
 
 class PipelineStage:
@@ -100,7 +101,8 @@ class InferencePipeline:
 
     def process_batch(self, batch):
         data = self.stages[0].process(batch)  # data_transfer
-        for i in range(1, len(self.stages)):
+        for i in range(1, len(self.stages)-1):
             data = self.stages[i].process(data)  # preprocess, inference, postprocess
-        peak_positions = data
+        torch.cuda.synchronize()  # Synchronize to ensure all CUDA operations are complete before postprocess with cupy to avoid undeterministic behaviors
+        peak_positions = self.stages[-1].process(data)
         return peak_positions
