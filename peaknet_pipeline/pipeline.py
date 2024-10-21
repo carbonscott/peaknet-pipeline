@@ -5,16 +5,12 @@ from contextlib import nullcontext
 from peaknet.tensor_transforms import PadAndCrop, InstanceNorm, MergeBatchChannelDims
 
 class PipelineStage:
-    def __init__(self, name, operation, device):
+    def __init__(self, name, operation):
         self.name = name
         self.operation = operation
-        self.stream = torch.cuda.Stream(device=device)
-        self.buffer = None
 
     def process(self, input_data):
-        with torch.cuda.stream(self.stream):
-            self.buffer = self.operation(input_data)
-        return self.buffer
+        return self.operation(input_data)
 
 class InferencePipeline:
     def __init__(self, model, device, mixed_precision_dtype, H, W):
@@ -25,14 +21,15 @@ class InferencePipeline:
         self.P = None  # TBD
         self.H = H
         self.W = W
-        self.stages = [
-            PipelineStage("data_transfer", self.data_transfer, device),
-            PipelineStage("preprocess", self.preprocess, device),
-            PipelineStage("inference", self.inference, device),
-            PipelineStage("postprocess", self.postprocess, device)
-        ]
         self.structure = cp.ones((3, 3), dtype=cp.float32)
         self.autocast_context = None
+        self.setup_autocast()
+        self.stages = [
+            PipelineStage("data_transfer", self.data_transfer),
+            PipelineStage("preprocess", self.preprocess),
+            PipelineStage("inference", self.inference),
+            PipelineStage("postprocess", self.postprocess)
+        ]
 
     def setup_autocast(self):
         device_type = 'cuda' if 'cuda' in str(self.device) else 'cpu'
@@ -42,7 +39,7 @@ class InferencePipeline:
             self.autocast_context = torch.amp.autocast(device_type=device_type, dtype=self.mixed_precision_dtype)
 
     def data_transfer(self, batch):
-        return batch.to(self.device, non_blocking=True)
+        return batch.to(self.device)
 
     def preprocess(self, batch):
         if self.B is None:
@@ -100,9 +97,7 @@ class InferencePipeline:
         return peak_positions
 
     def process_batch(self, batch):
-        data = self.stages[0].process(batch)  # data_transfer
-        for i in range(1, len(self.stages)-1):
-            data = self.stages[i].process(data)  # preprocess, inference, postprocess
-        torch.cuda.synchronize()  # Synchronize to ensure all CUDA operations are complete before postprocess with cupy to avoid undeterministic behaviors
-        peak_positions = self.stages[-1].process(data)
-        return peak_positions
+        data = batch
+        for stage in self.stages:
+            data = stage.process(data)
+        return data
