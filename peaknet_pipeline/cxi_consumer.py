@@ -46,6 +46,7 @@ def write_cxi_file(rank, images, peak_positions, output_dir, basename, chunk_id,
 
             # Create datasets
             f.create_dataset('/entry_1/data_1/data', (num_events, *image_shape), dtype='float32')
+            f.create_dataset('/entry_1/result_1/peakSegPosRaw', (num_events, max_num_peak), dtype='float32')
             f.create_dataset('/entry_1/result_1/peakXPosRaw', (num_events, max_num_peak), dtype='float32')
             f.create_dataset('/entry_1/result_1/peakYPosRaw', (num_events, max_num_peak), dtype='float32')
             f.create_dataset('/entry_1/result_1/nPeaks', (num_events,), dtype='int')
@@ -64,9 +65,10 @@ def write_cxi_file(rank, images, peak_positions, output_dir, basename, chunk_id,
                 num_peaks = len(cheetah_peaks)
                 f['/entry_1/result_1/nPeaks'][event_enum_idx] = num_peaks
 
-                for peak_enum_idx, (_, cheetahRow, cheetahCol) in enumerate(cheetah_peaks):
+                for peak_enum_idx, (seg, cheetahRow, cheetahCol) in enumerate(cheetah_peaks):
                     if peak_enum_idx >= max_num_peak:
                         break
+                    f['/entry_1/result_1/peakSegPosRaw'][event_enum_idx, peak_enum_idx] = seg
                     f['/entry_1/result_1/peakYPosRaw'][event_enum_idx, peak_enum_idx] = cheetahRow
                     f['/entry_1/result_1/peakXPosRaw'][event_enum_idx, peak_enum_idx] = cheetahCol
 
