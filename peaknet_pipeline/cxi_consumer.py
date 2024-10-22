@@ -49,6 +49,7 @@ def write_cxi_file(rank, images, peak_positions, output_dir, basename, chunk_id,
             f.create_dataset('/entry_1/result_1/peakXPosRaw', (num_events, max_num_peak), dtype='float32')
             f.create_dataset('/entry_1/result_1/peakYPosRaw', (num_events, max_num_peak), dtype='float32')
             f.create_dataset('/entry_1/result_1/nPeaks', (num_events,), dtype='int')
+            f.create_dataset('/entry_1/result_1/peakTotalIntensity', (num_events, max_num_peak), dtype = 'float32')  # Currently a placeholder, no real intensity value will be filled in
 
             # Create LCLS datasets
             f.create_dataset('/LCLS/detector_1/EncoderValue', (1,), dtype='float32', data=[encoder_value])
