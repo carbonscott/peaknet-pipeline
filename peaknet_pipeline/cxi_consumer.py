@@ -127,13 +127,13 @@ def consume_and_write(queue_name, ray_namespace, rank, output_dir, basename, sav
 
             retries = 0
 
-            # TODO: Need better logging... otherwise it feels like the queue is always empty
-            logging.info(f"Rank {rank}: Pulled data from Queue...")
-
             for image, peak_positions in data:
                 if len(peak_positions) >= min_num_peak:
                     accumulated_images.append(image)
                     accumulated_peak_positions.append(peak_positions)
+
+            # TODO: Need better logging... otherwise it feels like the queue is always empty
+            logging.info(f"Rank {rank} | iter = {iteration} | accum images = {len(accumulated_images)} | Pulled data from Queue...")
 
             iteration += 1
             if iteration % save_every == 0 and accumulated_images:
