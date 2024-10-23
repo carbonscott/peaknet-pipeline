@@ -133,7 +133,7 @@ def run_inference(args):
         base_delay = 0.1  # Base delay of 100ms
         max_delay = 2.0   # Maximum delay of 2 seconds
         batch_idx = 0
-        for batch in dataloader:
+        for batch, batch_photon_energy in dataloader:
             if batch.numel() == 0:
                 logging.warning("Received empty batch, skipping")
                 continue
@@ -142,7 +142,7 @@ def run_inference(args):
             peak_positions = pipeline.process_batch(batch)
 
             # Accumulate results for the batch
-            batch_results = list(zip(batch.cpu().numpy(), peak_positions))
+            batch_results = list(zip(batch.cpu().numpy(), peak_positions, batch_photon_energy))
             accumulated_results.extend(batch_results)
 
             # Push accumulated results to the new queue when we reach the accumulation step

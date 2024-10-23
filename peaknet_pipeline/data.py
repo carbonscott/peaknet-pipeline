@@ -33,11 +33,11 @@ class QueueDataset(IterableDataset):
                 logging.debug("No data received, stopping iteration")
                 raise StopIteration
 
-            rank, idx, image_data = data
+            rank, idx, image_data, photon_energy = data
             logging.info(f"Received data: rank={rank}, idx={idx}, image_shape={image_data.shape}")
             tensor = torch.tensor(image_data)
             if tensor.ndim == 2: tensor = tensor.unsqueeze(0)
-            return tensor
+            return tensor, photon_energy
 
         except DataReaderError as e:
             logging.error(f"DataReader error: {e}")

@@ -31,7 +31,7 @@ def signal_handler(sig, frame):
     MPI.Finalize()
     sys.exit(0)
 
-def write_cxi_file(rank, images, peak_positions, output_dir, basename, chunk_id, max_num_peak, encoder_value, photon_energy, cheetah_converter):
+def write_cxi_file(rank, images, peak_positions, output_dir, basename, chunk_id, max_num_peak, encoder_value, photon_energies, cheetah_converter):
     """
     Write a CXI file with the given images and peak positions.
     """
@@ -53,8 +53,8 @@ def write_cxi_file(rank, images, peak_positions, output_dir, basename, chunk_id,
             f.create_dataset('/entry_1/result_1/peakTotalIntensity', (num_events, max_num_peak), dtype = 'float32')  # Currently a placeholder, no real intensity value will be filled in
 
             # Create LCLS datasets
-            f.create_dataset('/LCLS/detector_1/EncoderValue', (1,), dtype='float32', data=[encoder_value])
-            f.create_dataset('/LCLS/photon_energy_eV', (1,), dtype='float32', data=[photon_energy])
+            f.create_dataset('/LCLS/detector_1/EncoderValue', (num_events,), dtype='float32', fillvalue=0.0)  # TODO
+            f.create_dataset('/LCLS/photon_energy_eV', data=photon_energies, dtype='float32')
 
             # Write data
             for event_enum_idx, (image, peaks) in enumerate(zip(images, peak_positions)):
@@ -78,7 +78,7 @@ def write_cxi_file(rank, images, peak_positions, output_dir, basename, chunk_id,
         logging.error(traceback.format_exc())
         raise
 
-def consume_and_write(queue_name, ray_namespace, rank, output_dir, basename, save_every, max_num_peak, min_num_peak, encoder_value, photon_energy, cheetah_converter):
+def consume_and_write(queue_name, ray_namespace, rank, output_dir, basename, save_every, max_num_peak, min_num_peak, encoder_value, cheetah_converter):
     """
     Consume peak positions from the specified Ray queue and write to CXI files.
     """
@@ -100,6 +100,7 @@ def consume_and_write(queue_name, ray_namespace, rank, output_dir, basename, sav
     chunk_id = 0
     accumulated_images = []
     accumulated_peak_positions = []
+    accumulated_photon_energy = []
 
     while not terminate:
         # Check if any rank has received the termination signal
@@ -129,17 +130,18 @@ def consume_and_write(queue_name, ray_namespace, rank, output_dir, basename, sav
 
             retries = 0
 
-            for image, peak_positions in data:
+            for image, peak_positions, photon_energy in data:
                 if len(peak_positions) >= min_num_peak:
                     accumulated_images.append(image)
                     accumulated_peak_positions.append(peak_positions)
+                    accumulated_photon_energy.append(photon_energy)
 
             # TODO: Need better logging... otherwise it feels like the queue is always empty
             logging.info(f"Rank {rank} | iter = {iteration} | accum images = {len(accumulated_images)} | Pulled data from Queue...")
 
             iteration += 1
             if iteration % save_every == 0 and accumulated_images:
-                write_cxi_file(rank, accumulated_images, accumulated_peak_positions, output_dir, basename, chunk_id, max_num_peak, encoder_value, photon_energy, cheetah_converter)
+                write_cxi_file(rank, accumulated_images, accumulated_peak_positions, output_dir, basename, chunk_id, max_num_peak, encoder_value, accumulated_photon_energy, cheetah_converter)
                 chunk_id += 1
                 accumulated_images = []
                 accumulated_peak_positions = []
@@ -159,7 +161,7 @@ def consume_and_write(queue_name, ray_namespace, rank, output_dir, basename, sav
     # Write any remaining data
     if accumulated_images:
         try:
-            write_cxi_file(rank, accumulated_images, accumulated_peak_positions, output_dir, basename, chunk_id, max_num_peak, encoder_value, photon_energy, cheetah_converter)
+            write_cxi_file(rank, accumulated_images, accumulated_peak_positions, output_dir, basename, chunk_id, max_num_peak, encoder_value, accumulated_photon_energy, cheetah_converter)
             logging.info(f"Rank {rank}: Wrote final CXI file.")
         except Exception as e:
             logging.error(f"Rank {rank}: Error writing final CXI file:")
@@ -190,8 +192,6 @@ def main():
                         help="Minimum number of peaks required to save an event")
     parser.add_argument("--encoder_value", type=float, default=0.0,
                         help="Encoder value for LCLS dataset")
-    parser.add_argument("--photon_energy", type=float, default=0.0,
-                        help="Photon energy for LCLS dataset")
     parser.add_argument("--geom_file", type=str, required=True,
                         help="Path to the geometry file for CheetahConverter")
     args = parser.parse_args()
@@ -240,7 +240,6 @@ def main():
         max_num_peak=args.max_num_peak,
         min_num_peak=args.min_num_peak,
         encoder_value=args.encoder_value,
-        photon_energy=args.photon_energy,
         cheetah_converter=cheetah_converter
     )
 
