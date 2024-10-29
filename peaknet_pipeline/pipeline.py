@@ -4,16 +4,50 @@ from cupyx.scipy import ndimage
 from contextlib import nullcontext
 from peaknet.tensor_transforms import PadAndCrop, InstanceNorm, MergeBatchChannelDims
 
+import logging
+import time
+
+class Timer:
+    def __init__(self, tag=None, is_on=True, cuda_sync=False):
+        self.tag = tag
+        self.is_on = is_on
+        self.cuda_sync = cuda_sync
+        self.duration = None
+
+    def __enter__(self):
+        if self.is_on:
+            if self.cuda_sync:
+                torch.cuda.synchronize()
+            self.start = time.monotonic()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.is_on:
+            if self.cuda_sync:
+                torch.cuda.synchronize()
+            self.end = time.monotonic()
+            self.duration = self.end - self.start
+            if self.tag is not None:
+                logging.info(f"{self.tag}, duration: {self.duration:.4f} sec.")
+
 class PipelineStage:
-    def __init__(self, name, operation):
+    def __init__(self, name, operation, enable_timing=True, cuda_sync=False):
         self.name = name
         self.operation = operation
+        self.enable_timing = enable_timing
+        self.cuda_sync = cuda_sync
+        self.timer = Timer(tag=f"Stage: {name}", is_on=enable_timing, cuda_sync=cuda_sync)
 
     def process(self, input_data):
-        return self.operation(input_data)
+        with self.timer:
+            return self.operation(input_data)
+
+    @property
+    def last_duration(self):
+        return self.timer.duration if self.timer.duration is not None else 0.0
 
 class InferencePipeline:
-    def __init__(self, model, device, mixed_precision_dtype, H, W):
+    def __init__(self, model, device, mixed_precision_dtype, H, W, enable_timing=True):
         self.model = model
         self.device = device
         self.mixed_precision_dtype = mixed_precision_dtype
@@ -24,11 +58,18 @@ class InferencePipeline:
         self.structure = cp.ones((3, 3), dtype=cp.float32)
         self.autocast_context = None
         self.setup_autocast()
+
+        # Determine which stages need CUDA synchronization
+        is_cuda = 'cuda' in str(self.device)
         self.stages = [
-            PipelineStage("data_transfer", self.data_transfer),
-            PipelineStage("preprocess", self.preprocess),
-            PipelineStage("inference", self.inference),
-            PipelineStage("postprocess", self.postprocess)
+            PipelineStage("data_transfer", self.data_transfer,
+                         enable_timing=enable_timing, cuda_sync=is_cuda),
+            PipelineStage("preprocess", self.preprocess,
+                         enable_timing=enable_timing, cuda_sync=is_cuda),
+            PipelineStage("inference", self.inference,
+                         enable_timing=enable_timing, cuda_sync=is_cuda),
+            PipelineStage("postprocess", self.postprocess,
+                         enable_timing=enable_timing, cuda_sync=is_cuda)
         ]
 
     def setup_autocast(self):
@@ -101,3 +142,17 @@ class InferencePipeline:
         for stage in self.stages:
             data = stage.process(data)
         return data
+
+    def get_stage_durations(self):
+        """Returns a dictionary of stage names and their last recorded durations."""
+        return {stage.name: stage.last_duration for stage in self.stages}
+
+    def get_total_duration(self):
+        """Returns the total duration of all stages from the last run."""
+        return sum(stage.last_duration for stage in self.stages)
+
+    def set_timing_enabled(self, enabled):
+        """Enable or disable timing for all stages."""
+        for stage in self.stages:
+            stage.enable_timing = enabled
+            stage.timer.is_on = enabled

@@ -66,6 +66,8 @@ def load_model(config_path, weights_path):
     state_dict = torch.load(weights_path, map_location='cpu')
     model.load_state_dict(state_dict)
 
+    model.eval()
+
     return model
 
 def run_inference(args):
@@ -104,6 +106,12 @@ def run_inference(args):
         model = load_model(args.config_path, args.weights_path)
         model.to(device)
 
+        model = torch.compile(
+            model,
+            mode="reduce-overhead",  # Reduces function call overhead
+            backend="inductor",      # Optimized backend for inference
+        )
+
         # Set up the data reader and dataset
         dataset = QueueDataset(queue_name=args.input_queue_name, ray_namespace=args.ray_namespace)
 
@@ -124,7 +132,7 @@ def run_inference(args):
         mixed_precision_dtype = dtype_map[args.dtype]
 
         # Create and run the inference pipeline
-        pipeline = InferencePipeline(model, device, mixed_precision_dtype, args.H, args.W)
+        pipeline = InferencePipeline(model, device, mixed_precision_dtype, args.H, args.W, args.enable_timing)
         pipeline.setup_autocast()
 
         logging.info("InferencePipeline created, starting inference")
@@ -210,6 +218,7 @@ def main():
                         help="Data type for mixed precision")
     parser.add_argument("--H", type=int, default=512, help="Height of the image in inference")
     parser.add_argument("--W", type=int, default=512, help="Width of the image in inference")
+    parser.add_argument("--enable_timing", action='store_true', help="Enable timing each stage")
     parser.add_argument("--accumulation_steps", type=int, default=10, help="Accumulation step before pushing to queue")
     parser.add_argument("--dist_backend", type=str, default="nccl", choices=["nccl", "gloo"],
                         help="Distributed backend to use")
