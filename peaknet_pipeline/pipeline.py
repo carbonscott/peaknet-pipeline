@@ -2,7 +2,7 @@ import torch
 import cupy as cp
 from cupyx.scipy import ndimage
 from contextlib import nullcontext
-from peaknet.tensor_transforms import PadAndCrop, InstanceNorm, MergeBatchChannelDims
+from peaknet.tensor_transforms import Crop, InstanceNorm, MergeBatchChannelDims
 
 import logging
 import time
@@ -87,7 +87,7 @@ class InferencePipeline:
             self.B, self.P, _, _ = batch.size()
         pad_style = 'top-left'
         transforms = (
-            PadAndCrop(self.H, self.W, pad_style),
+            Crop(self.H, self.W, pad_style),  # Bottom-right style padding is supported by default in the underlying crop function if the input size is smaller than the final crop size
             InstanceNorm(),
             MergeBatchChannelDims(),
         )
