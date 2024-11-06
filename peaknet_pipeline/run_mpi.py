@@ -191,7 +191,8 @@ def run_inference(args):
                 except ray.exceptions.GetTimeoutError:
                     logging.warning(f"Rank {dist_local_rank}, Device {device}: Timeout while pushing final results, retrying...")
 
-        # Signal end of data
+        # Sync progress and signal end of data
+        comm.Barrier()
         if dist_rank == 0:
             ray.get(peak_positions_queue.put.remote(TERMINATION_SIGNAL))
             logging.info("Sent end-of-data signal to peak results queue")
