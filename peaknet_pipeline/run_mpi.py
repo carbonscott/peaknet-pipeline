@@ -146,6 +146,8 @@ def run_inference(args):
                 logging.warning("Received empty batch, skipping")
                 continue
 
+            torch.cuda.empty_cache()
+
             logging.info(f"Processing batch {batch_idx} of shape: {batch.shape}")
             peak_positions = pipeline.process_batch(batch)
 
