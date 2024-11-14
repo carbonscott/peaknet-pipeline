@@ -70,6 +70,27 @@ def load_model(config_path, weights_path):
 
     return model
 
+def barrier_with_timeout(comm, timeout=60):
+    """
+    Implements a non-blocking barrier with a timeout.
+
+    Args:
+        comm: MPI communicator.
+        timeout: Maximum time to wait for the barrier in seconds.
+
+    Returns:
+        True if the barrier was successfully reached within the timeout, False otherwise.
+    """
+    request = comm.Ibarrier()
+    start_time = time.time()
+    while True:
+        flag = request.Test()  # All ranks have reached this point???
+        if flag:
+            return True
+        if time.time() - start_time > timeout:
+            return False
+        time.sleep(1)
+
 def run_inference(args):
     # Enable distributed env
     init_dist_env()
@@ -200,12 +221,25 @@ def run_inference(args):
                     logging.warning(f"Rank {dist_local_rank}, Device {device}: Timeout while pushing final results, retrying...")
 
         # Sync progress and signal end of data
-        comm.Barrier()
+        barrier_success = barrier_with_timeout(comm, timeout=60)
+        if not barrier_success:
+            logging.error("Final Barrier timeout reached. One or more processes may have failed.")
+            raise TimeoutError("Final MPI Barrier timed out due to process failure.")
+        else:
+            logging.info("All processes have reached the final barrier successfully.")
+
         if dist_rank == 0:
             for _ in range(args.num_consumers):
-                ray.get(peak_positions_queue.put.remote(TERMINATION_SIGNAL))
+                try:
+                    ray.get(peak_positions_queue.put.remote(TERMINATION_SIGNAL))
+                except ray.exceptions.RayActorError as rae:
+                    logging.error(f"RayActorError while sending termination signal: {rae}")
+                except Exception as ex:
+                    logging.error(f"Unexpected error while sending termination signal: {ex}")
             logging.info("Sent end-of-data signal to peak results queue")
 
+    except TimeoutError as te:
+        logging.error(f"TimeoutError: {te}")
     except KeyboardInterrupt:
         logging.info("Interrupt received, cleaning up...")
     except Exception as e:
@@ -217,6 +251,7 @@ def run_inference(args):
         ray.shutdown()
         MPI.Finalize()
         logging.info("Inference completed or terminated. Exiting...")
+        sys.exit(0)
 
 def main():
     parser = argparse.ArgumentParser(description="Distributed Inference Pipeline")
