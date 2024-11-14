@@ -111,11 +111,12 @@ def run_inference(args):
         model = load_model(args.config_path, args.weights_path)
         model.to(device)
 
-        model = torch.compile(
-            model,
-            mode="reduce-overhead",  # Reduces function call overhead
-            backend="inductor",      # Optimized backend for inference
-        )
+        if args.compile:
+            model = torch.compile(
+                model,
+                mode="reduce-overhead",  # Reduces function call overhead
+                backend="inductor",      # Optimized backend for inference
+            )
 
         # Set up the data reader and dataset
         dataset = QueueDataset(queue_name=args.input_queue_name, ray_namespace=args.ray_namespace)
@@ -201,7 +202,8 @@ def run_inference(args):
         # Sync progress and signal end of data
         comm.Barrier()
         if dist_rank == 0:
-            ray.get(peak_positions_queue.put.remote(TERMINATION_SIGNAL))
+            for _ in range(args.num_consumers):
+                ray.get(peak_positions_queue.put.remote(TERMINATION_SIGNAL))
             logging.info("Sent end-of-data signal to peak results queue")
 
     except KeyboardInterrupt:
@@ -230,6 +232,8 @@ def main():
     parser.add_argument("--accumulation_steps", type=int, default=10, help="Accumulation step before pushing to queue")
     parser.add_argument("--dist_backend", type=str, default="nccl", choices=["nccl", "gloo"],
                         help="Distributed backend to use")
+    parser.add_argument("--num_consumers", type=int, default=1, help="Number of consumer processes expected.")
+    parser.add_argument("--compile", action='store_true', help="Turn on `torch.compile`.")
     parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                         help="Logging level")
 

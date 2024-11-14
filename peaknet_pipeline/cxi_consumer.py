@@ -103,19 +103,13 @@ def consume_and_write(queue_name, ray_namespace, rank, output_dir, basename, sav
     accumulated_photon_energy = []
 
     while not terminate:
-        # Check if any rank has received the termination signal
-        terminate = comm.bcast(terminate, root=0)
-        if terminate:
-            logging.info(f"Rank {rank}: Received broadcast termination signal.")
-            break
-
         try:
             data = ray.get(peak_positions_queue.get.remote())
 
             if data == TERMINATION_SIGNAL:
                 logging.info(f"Rank {rank}: Received sentinel. No more data to consume.")
                 terminate = True
-                terminate = comm.bcast(terminate, root=rank)
+                terminate = comm.allreduce(terminate, op=MPI.LOR)  # Blocking until allreduce is done
                 break
 
             if data is None:
@@ -157,6 +151,9 @@ def consume_and_write(queue_name, ray_namespace, rank, output_dir, basename, sav
             logging.error(f"Rank {rank}: Error while consuming data:")
             logging.error(traceback.format_exc())
             time.sleep(base_delay)
+
+        # Aggregate termination signals across all ranks
+        terminate = comm.allreduce(terminate, op=MPI.LOR)
 
     # Write any remaining data
     if accumulated_images:
