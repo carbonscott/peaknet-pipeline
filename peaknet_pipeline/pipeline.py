@@ -72,6 +72,9 @@ class InferencePipeline:
                          enable_timing=enable_timing, cuda_sync=is_cuda)
         ]
 
+        # Reduce memory
+        torch.backends.cuda.matmul.allow_tf32 = True
+
     def setup_autocast(self):
         device_type = 'cuda' if 'cuda' in str(self.device) else 'cpu'
         if device_type == 'cpu' or self.mixed_precision_dtype == torch.float32:

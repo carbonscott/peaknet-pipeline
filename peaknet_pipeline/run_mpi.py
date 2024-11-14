@@ -90,11 +90,16 @@ def run_inference(args):
         comm = MPI.COMM_WORLD
 
         if dist_rank == 0:
-            # Queue does not exist; create it
-            peak_positions_queue = create_queue(queue_name=args.output_queue_name,
-                                                ray_namespace=args.ray_namespace,
-                                                maxsize=args.output_queue_size)
-            logging.info(f"Created output_queue_name: {args.output_queue_name} in namespace: {args.ray_namespace}")
+            # Try to connect to existing queue first
+            try:
+                peak_positions_queue = ray.get_actor(args.output_queue_name, namespace=args.ray_namespace)
+                logging.info(f"Connected to existing output_queue_name: {args.output_queue_name} in namespace: {args.ray_namespace}")
+            except ValueError:  # Ray raises ValueError when actor is not found
+                # Queue doesn't exist; create it
+                peak_positions_queue = create_queue(queue_name=args.output_queue_name,
+                                                    ray_namespace=args.ray_namespace,
+                                                    maxsize=args.output_queue_size)
+                logging.info(f"Created output_queue_name: {args.output_queue_name} in namespace: {args.ray_namespace}")
         # Synchronize all ranks to ensure the queue is created before others try to connect
         comm.Barrier()
 
@@ -106,11 +111,11 @@ def run_inference(args):
         model = load_model(args.config_path, args.weights_path)
         model.to(device)
 
-        model = torch.compile(
-            model,
-            mode="reduce-overhead",  # Reduces function call overhead
-            backend="inductor",      # Optimized backend for inference
-        )
+        ## model = torch.compile(
+        ##     model,
+        ##     ## mode="reduce-overhead",  # Reduces function call overhead
+        ##     ## backend="inductor",      # Optimized backend for inference
+        ## )
 
         # Set up the data reader and dataset
         dataset = QueueDataset(queue_name=args.input_queue_name, ray_namespace=args.ray_namespace)
