@@ -111,11 +111,11 @@ def run_inference(args):
         model = load_model(args.config_path, args.weights_path)
         model.to(device)
 
-        ## model = torch.compile(
-        ##     model,
-        ##     ## mode="reduce-overhead",  # Reduces function call overhead
-        ##     ## backend="inductor",      # Optimized backend for inference
-        ## )
+        model = torch.compile(
+            model,
+            mode="reduce-overhead",  # Reduces function call overhead
+            backend="inductor",      # Optimized backend for inference
+        )
 
         # Set up the data reader and dataset
         dataset = QueueDataset(queue_name=args.input_queue_name, ray_namespace=args.ray_namespace)
