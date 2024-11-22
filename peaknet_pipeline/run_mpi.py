@@ -14,6 +14,8 @@ from peaknet.modeling.convnextv2_bifpn_net import PeakNet, PeakNetConfig, SegHea
 from peaknet.modeling.bifpn_config import BiFPNConfig, BiFPNBlockConfig, BNConfig, FusionConfig
 from transformers.models.convnextv2.configuration_convnextv2 import ConvNextV2Config
 
+from contextlib import nullcontext
+
 from .mpi_utils import init_dist_env
 from .data import QueueDataset
 from .pipeline import InferencePipeline
@@ -132,12 +134,56 @@ def run_inference(args):
         model = load_model(args.config_path, args.weights_path)
         model.to(device)
 
+        # Map string dtype to torch dtype
+        dtype_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        mixed_precision_dtype = dtype_map[args.dtype]
+
+        # Compile model if requested - each rank proceeds independently
         if args.compile:
-            model = torch.compile(
-                model,
-                mode="reduce-overhead",  # Reduces function call overhead
-                backend="inductor",      # Optimized backend for inference
-            )
+            try:
+                logging.info(f"Rank {dist_rank}: Starting model compilation")
+                compilation_start = time.time()
+
+                device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
+                if device_type == 'cpu' or mixed_precision_dtype == torch.float32:
+                    autocast_context = nullcontext()
+                else:
+                    autocast_context = torch.amp.autocast(device_type=device_type, dtype=mixed_precision_dtype)
+
+                model = torch.compile(
+                    model,
+                    mode="reduce-overhead",
+                    backend="inductor",
+                )
+
+                # Simple warmup without barriers
+                batch_sizes = args.warmup_batch_sizes
+                with torch.no_grad():
+                    with autocast_context:
+                        for batch_size in batch_sizes:
+                            dummy_batch = torch.randn((batch_size, 1, args.H, args.W), device=device, dtype=mixed_precision_dtype)
+                            _ = model(dummy_batch)
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+
+                compilation_time = time.time() - compilation_start
+                logging.info(f"Rank {dist_rank}: Compilation successful, took {compilation_time:.2f} seconds")
+
+                torch.cuda.empty_cache()
+
+            except Exception as e:
+                logging.error(f"Rank {dist_rank}: Compilation failed: {str(e)}")
+                logging.warning(f"Rank {dist_rank}: Falling back to uncompiled model")
+                logging.error("Traceback:")
+                logging.error(traceback.format_exc())
+
+                # Reload the model if compilation failed
+                model = load_model(args.config_path, args.weights_path)
+                model.to(device)
 
         # Set up the data reader and dataset
         dataset = QueueDataset(queue_name=args.input_queue_name, ray_namespace=args.ray_namespace)
@@ -149,14 +195,6 @@ def run_inference(args):
             num_workers=args.num_workers,
             pin_memory=True,
         )
-
-        # Map string dtype to torch dtype
-        dtype_map = {
-            "float32": torch.float32,
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-        }
-        mixed_precision_dtype = dtype_map[args.dtype]
 
         # Create and run the inference pipeline
         pipeline = InferencePipeline(model, device, mixed_precision_dtype, args.H, args.W, args.enable_timing)
@@ -173,7 +211,7 @@ def run_inference(args):
                 logging.warning("Received empty batch, skipping")
                 continue
 
-            torch.cuda.empty_cache()
+            ## torch.cuda.empty_cache()
 
             logging.info(f"Processing batch {batch_idx} of shape: {batch.shape}")
             peak_positions = pipeline.process_batch(batch)
@@ -221,7 +259,7 @@ def run_inference(args):
                     logging.warning(f"Rank {dist_local_rank}, Device {device}: Timeout while pushing final results, retrying...")
 
         # Sync progress and signal end of data
-        barrier_success = barrier_with_timeout(comm, timeout=60)
+        barrier_success = barrier_with_timeout(comm, timeout=300)
         if not barrier_success:
             logging.error("Final Barrier timeout reached. One or more processes may have failed.")
             raise TimeoutError("Final MPI Barrier timed out due to process failure.")
@@ -269,6 +307,13 @@ def main():
                         help="Distributed backend to use")
     parser.add_argument("--num_consumers", type=int, default=1, help="Number of consumer processes expected.")
     parser.add_argument("--compile", action='store_true', help="Turn on `torch.compile`.")
+    parser.add_argument(
+        "--warmup_batch_sizes",
+        type=int,
+        nargs='+',
+        default=[4,3,2,1],
+        help="Space-separated list of batch sizes to use for warmup (e.g., '4 3 2 1')"
+    )
     parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                         help="Logging level")
 
