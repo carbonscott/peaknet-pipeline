@@ -4,158 +4,161 @@ from cupyx.scipy import ndimage
 from contextlib import nullcontext
 from peaknet.tensor_transforms import Crop, InstanceNorm, MergeBatchChannelDims
 
-import logging
-import time
-
-class Timer:
-    def __init__(self, tag=None, is_on=True, cuda_sync=False):
-        self.tag = tag
-        self.is_on = is_on
-        self.cuda_sync = cuda_sync
-        self.duration = None
-
-    def __enter__(self):
-        if self.is_on:
-            if self.cuda_sync:
-                torch.cuda.synchronize()
-            self.start = time.monotonic()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.is_on:
-            if self.cuda_sync:
-                torch.cuda.synchronize()
-            self.end = time.monotonic()
-            self.duration = self.end - self.start
-            if self.tag is not None:
-                logging.info(f"{self.tag}, duration: {self.duration:.4f} sec.")
-
-class PipelineStage:
-    def __init__(self, name, operation, enable_timing=True, cuda_sync=False):
-        self.name = name
-        self.operation = operation
-        self.enable_timing = enable_timing
-        self.cuda_sync = cuda_sync
-        self.timer = Timer(tag=f"Stage: {name}", is_on=enable_timing, cuda_sync=cuda_sync)
-
-    def process(self, input_data):
-        with self.timer:
-            return self.operation(input_data)
-
-    @property
-    def last_duration(self):
-        return self.timer.duration if self.timer.duration is not None else 0.0
-
 class InferencePipeline:
-    def __init__(self, model, device, mixed_precision_dtype, H, W, enable_timing=True):
+    def __init__(self,
+                 model,
+                 device,
+                 mixed_precision_dtype,
+                 H, W,
+                 num_overlap=2):
+        """
+        Args:
+            model (torch.nn.Module): Your PyTorch model (already on device).
+            device (torch.device or str): e.g. 'cuda:0'.
+            mixed_precision_dtype (torch.dtype): e.g. torch.float16.
+            H, W (int): Dimensions for cropping.
+            num_overlap (int): Size of ring buffer for concurrency.
+        """
         self.model = model
         self.device = device
         self.mixed_precision_dtype = mixed_precision_dtype
-        self.B = None  # TBD
-        self.P = None  # TBD
         self.H = H
         self.W = W
+        self.B = None
+        self.P = None
+
+        # Create GPU streams for each stage
+        self.stage1_h2d_stream = torch.cuda.Stream()
+        self.stage2_preprocess_stream = torch.cuda.Stream()
+        self.stage3_inference_stream = torch.cuda.Stream()
+        self.stage4_postprocess_stream = torch.cuda.Stream()
+
+        # We keep ring buffers for intermediate outputs
+        self.num_overlap = num_overlap
+        self.preproc_outputs = [None] * num_overlap
+        self.inference_outputs = [None] * num_overlap
+        self.postprocess_outputs = [None] * num_overlap
+
+        # Pre-build a small struct for cupy ops
         self.structure = cp.ones((3, 3), dtype=cp.float32)
-        self.autocast_context = None
-        self.setup_autocast()
 
-        # Determine which stages need CUDA synchronization
-        is_cuda = 'cuda' in str(self.device)
-        self.stages = [
-            PipelineStage("data_transfer", self.data_transfer,
-                         enable_timing=enable_timing, cuda_sync=is_cuda),
-            PipelineStage("preprocess", self.preprocess,
-                         enable_timing=enable_timing, cuda_sync=is_cuda),
-            PipelineStage("inference", self.inference,
-                         enable_timing=enable_timing, cuda_sync=is_cuda),
-            PipelineStage("postprocess", self.postprocess,
-                         enable_timing=enable_timing, cuda_sync=is_cuda)
-        ]
+        # Set up autocast context
+        if "cuda" in str(device) and mixed_precision_dtype != torch.float32:
+            self.autocast_context = torch.amp.autocast(device_type='cuda',
+                                                       dtype=mixed_precision_dtype)
+        else:
+            self.autocast_context = nullcontext()
 
-        # Reduce memory
+        # Optional: enable TF32 for matmul on Ampere+ GPUs
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    def setup_autocast(self):
-        device_type = 'cuda' if 'cuda' in str(self.device) else 'cpu'
-        if device_type == 'cpu' or self.mixed_precision_dtype == torch.float32:
-            self.autocast_context = nullcontext()
-        else:
-            self.autocast_context = torch.amp.autocast(device_type=device_type, dtype=self.mixed_precision_dtype)
+    def stage1_h2d(self, batch_cpu):
+        """Stage 1: Transfer CPU -> GPU."""
+        return batch_cpu.to(self.device, non_blocking=True)
 
-    def data_transfer(self, batch):
-        return batch.to(self.device)
-
-    def preprocess(self, batch):
+    def stage2_preprocess(self, batch_gpu):
+        """Stage 2: Crop, InstanceNorm, MergeBatchChannelDims."""
         if self.B is None:
-            self.B, self.P, _, _ = batch.size()
-        pad_style = 'top-left'
+            self.B, self.P, _, _ = batch_gpu.shape
+
         transforms = (
-            Crop(self.H, self.W, pad_style),  # Bottom-right style padding is supported by default in the underlying crop function if the input size is smaller than the final crop size
+            Crop(self.H, self.W, "top-left"),
             InstanceNorm(),
             MergeBatchChannelDims(),
         )
         for trans in transforms:
-            batch = trans(batch)
-        return batch
+            batch_gpu = trans(batch_gpu)
+        return batch_gpu
 
-    def inference(self, batch):
+    def stage3_inference(self, preproc_out):
+        """Stage 3: Inference with optional AMP autocast."""
         with torch.no_grad():
             with self.autocast_context:
-                feature_pred = self.model(batch)
-        return feature_pred.softmax(dim=1).argmax(dim=1, keepdim=True)
+                logits = self.model(preproc_out)
+        return logits.softmax(dim=1).argmax(dim=1, keepdim=True)
 
-    def postprocess(self, seg_maps):
-        """
-        Process segmentation maps to find peak positions for each batch item.
+    def stage4_postprocess(self, seg_maps):
+        """Stage 4: label + center_of_mass with CuPy."""
+        B = seg_maps.size(0) // self.P
+        peak_positions = [[] for _ in range(B)]
 
-        This function takes a 4D tensor of segmentation maps and processes each map
-        to find peak positions. The peaks are then grouped by batch item.
-
-        Args:
-            seg_maps (tensor): A 4D tensor of shape (BP, 1, H, W) where:
-                B is the batch size,
-                P is the number of panels per batch item,
-                H is the height of each segmentation map,
-                W is the width of each segmentation map.
-
-        Returns:
-            list of lists: A list containing B sublists, where B is the batch size.
-            Each sublist contains peak positions for a single batch item across all
-            its panels. Each peak position is represented as [p, y, x], where:
-                p is the panel index (0 to P-1),
-                y is the y-coordinate of the peak,
-                x is the x-coordinate of the peak.
-            The [p, y, x] format is required by downstream software for further processing.
-        """
-        B = seg_maps.size(0) // self.P  # BP//P
-        peak_positions = [[] for _ in range(B)]  # Initialize a list for each batch item
-        for idx, seg_map in enumerate(seg_maps.flatten(0,1)):  # (BP,1,H,W)->(BP,H,W), loop over all panels
-            seg_map_cp = cp.asarray(seg_map, dtype=cp.float32)
-            labeled_map, num_peaks = ndimage.label(seg_map_cp, self.structure)
-            peak_coords = ndimage.center_of_mass(seg_map_cp, cp.asarray(labeled_map, dtype=cp.float32), cp.arange(1, num_peaks + 1))
-            if len(peak_coords) > 0:
-                # Append coordinates for this segmap to the corresponding batch item
-                b = idx // self.P  # Batch index
-                p = idx % self.P   # Panel index within the batch item
-                peak_positions[b].extend([p] + peak.tolist() for peak in peak_coords if len(peak) > 0)
+        cupy_stream = cp.cuda.ExternalStream(ptr=torch.cuda.current_stream().cuda_stream)
+        with cupy_stream.use():
+            for idx, seg_map in enumerate(seg_maps.flatten(0,1)):
+                seg_map_cp = cp.asarray(seg_map, dtype=cp.float32)
+                labeled_map, num_peaks = ndimage.label(seg_map_cp, self.structure)
+                peak_coords = ndimage.center_of_mass(
+                    seg_map_cp,
+                    cp.asarray(labeled_map, dtype=cp.float32),
+                    cp.arange(1, num_peaks + 1)
+                )
+                if len(peak_coords) > 0:
+                    b = idx // self.P
+                    p = idx % self.P
+                    peak_positions[b].extend(
+                        ([p] + peak.tolist()) for peak in peak_coords if len(peak) > 0
+                    )
         return peak_positions
 
-    def process_batch(self, batch):
-        data = batch
-        for stage in self.stages:
-            data = stage.process(data)
-        return data
+    def process_batch(self, batch_cpu, batch_idx):
+        """
+        Launch the pipeline stages asynchronously for a single batch,
+        storing results in ring buffer slot `buf_idx`.
+        Returns: a torch.cuda.Event that signals completion of stage4_postprocessing.
+        """
+        buf_idx = batch_idx % self.num_overlap
 
-    def get_stage_durations(self):
-        """Returns a dictionary of stage names and their last recorded durations."""
-        return {stage.name: stage.last_duration for stage in self.stages}
+        # We create events to signal each stage's completion
+        transfer_done = torch.cuda.Event()
+        stage2_preprocess_done = torch.cuda.Event()
+        stage3_inference_done = torch.cuda.Event()
+        stage4_postprocess_done = torch.cuda.Event()
 
-    def get_total_duration(self):
-        """Returns the total duration of all stages from the last run."""
-        return sum(stage.last_duration for stage in self.stages)
+        # Stage 1: H2D
+        with torch.cuda.stream(self.stage1_h2d_stream):
+            gpu_batch = self.stage1_h2d(batch_cpu)
+            transfer_done.record(self.stage1_h2d_stream)
 
-    def set_timing_enabled(self, enabled):
-        """Enable or disable timing for all stages."""
-        for stage in self.stages:
-            stage.enable_timing = enabled
-            stage.timer.is_on = enabled
+        # Stage 2: Preprocess
+        with torch.cuda.stream(self.stage2_preprocess_stream):
+            self.stage2_preprocess_stream.wait_event(transfer_done)
+            preproc_out = self.stage2_preprocess(gpu_batch)
+            self.preproc_outputs[buf_idx] = preproc_out
+            stage2_preprocess_done.record(self.stage2_preprocess_stream)
+
+        # Stage 3: Inference
+        with torch.cuda.stream(self.stage3_inference_stream):
+            self.stage3_inference_stream.wait_event(stage2_preprocess_done)
+            inf_out = self.stage3_inference(self.preproc_outputs[buf_idx])
+            self.inference_outputs[buf_idx] = inf_out
+            stage3_inference_done.record(self.stage3_inference_stream)
+
+        # Stage 4: Postprocess
+        with torch.cuda.stream(self.stage4_postprocess_stream):
+            self.stage4_postprocess_stream.wait_event(stage3_inference_done)
+            final_out = self.stage4_postprocess(self.inference_outputs[buf_idx])
+            self.postprocess_outputs[buf_idx] = final_out
+            stage4_postprocess_done.record(self.stage4_postprocess_stream)
+
+        return stage4_postprocess_done
+
+    def process_batches(self, batches_cpu):
+        """
+        Dispatch multiple batches in an overlapped manner.
+        After scheduling all, we wait for each final event
+        and retrieve the output from the ring buffer.
+        """
+        final_events = []
+        for i, batch_cpu in enumerate(batches_cpu):
+            # Launch the pipeline for each batch
+            ev = self.process_batch(batch_cpu, i)
+            final_events.append((i, ev))
+
+        # Wait for each final event in order, gather results
+        results = []
+        for i, ev in final_events:
+            ev.synchronize()  # wait for stage4_postprocess to complete
+            buf_idx = i % self.num_overlap
+            results.append(self.postprocess_outputs[buf_idx])
+
+        return results
