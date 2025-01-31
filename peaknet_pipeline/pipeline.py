@@ -39,9 +39,9 @@ class InferencePipeline:
         self.num_overlap = num_overlap
         self.preproc_outputs = [None] * num_overlap
         self.inference_outputs = [None] * num_overlap
-        self.pinned_buffers = [None] * num_overlap
-        self.stage4_d2h_events = [None] * num_overlap
-        self.final_events = [None] * num_overlap
+        ## self.pinned_buffers = [None] * num_overlap
+        ## self.stage4_d2h_events = [None] * num_overlap
+        ## self.final_events = [None] * num_overlap
 
         ## # Pre-build a small struct for cupy ops
         ## self.structure = cp.ones((3, 3), dtype=cp.float32)
@@ -81,19 +81,18 @@ class InferencePipeline:
                 logits = self.model(preproc_out)
         return logits.softmax(dim=1).argmax(dim=1, keepdim=True)
 
-    def stage4_d2h_copy(self, gpu_tensor, pinned_buf):
+    def stage4_d2h_copy(self, gpu_tensor):
         """
         Stage 4: Copy GPU tensor to pinned CPU buffer (pure function,
         no direct reference to streams or events).
         """
         # Allocate pinned_buf if not done yet
-        if pinned_buf is None:
-            pinned_buf = torch.empty_like(
-                gpu_tensor,
-                device='cpu',  # CPU side
-                pin_memory=True,
-                requires_grad=False
-            )
+        pinned_buf = torch.empty_like(
+            gpu_tensor,
+            device='cpu',  # CPU side
+            pin_memory=True,
+            requires_grad=False
+        )
         # Asynchronous copy into pinned_buf
         pinned_buf.copy_(gpu_tensor, non_blocking=True)
         return pinned_buf
@@ -143,15 +142,11 @@ class InferencePipeline:
         with torch.cuda.stream(self.stage4_d2h_stream):
             self.stage4_d2h_stream.wait_event(stage3_inference_done)
             nvtx.range_push("Stage 4: D2H Copy")
-            pinned_buf = self.stage4_d2h_copy(
-                gpu_tensor=self.inference_outputs[buf_idx],
-                pinned_buf=self.pinned_buffers[buf_idx]
-            )
-            self.pinned_buffers[buf_idx] = pinned_buf
+            pinned_buf = self.stage4_d2h_copy(self.inference_outputs[buf_idx])
             stage4_d2h_done.record(self.stage4_d2h_stream)
             nvtx.range_pop()
 
-        return stage4_d2h_done
+        return pinned_buf, stage4_d2h_done
 
     def process_batches(self, batches_cpu):
         """
@@ -183,29 +178,5 @@ class InferencePipeline:
         batch_count = 0
 
         for batch_cpu in batches_cpu:
-            buf_idx = batch_count % self.num_overlap
-
-            # Launch the pipeline for this batch
-            final_event = self.process_batch(batch_cpu, batch_count)
-            self.final_events[buf_idx] = final_event
-
-            # Once we have at least num_overlap outstanding, yield the earliest done
-            if batch_count >= self.num_overlap:
-                earliest_done_idx = batch_count - self.num_overlap
-                yield self.fetch_output(earliest_done_idx)
-
+            yield self.process_batch(batch_cpu, batch_count)
             batch_count += 1
-
-        # Flush any remaining
-        for tail_idx in range(batch_count - self.num_overlap, batch_count):
-            if tail_idx >= 0:
-                yield self.fetch_output(tail_idx)
-
-    def fetch_output(self, batch_idx):
-        """
-        Wait for stage4's final event to ensure the pinned buffer
-        is ready on CPU, then return that pinned buffer.
-        """
-        buf_idx = batch_idx % self.num_overlap
-        self.final_events[buf_idx].synchronize()  # CPU-side wait needed for reading
-        return self.pinned_buffers[buf_idx]
