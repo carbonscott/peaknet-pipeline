@@ -1,6 +1,6 @@
 import torch
-## import cupy as cp
-## from cupyx.scipy import ndimage
+import cupy as cp
+from cupyx.scipy import ndimage
 from contextlib import nullcontext
 from peaknet.tensor_transforms import Crop, InstanceNorm, MergeBatchChannelDims
 
@@ -33,18 +33,16 @@ class InferencePipeline:
         self.stage1_h2d_stream = torch.cuda.Stream()
         self.stage2_preprocess_stream = torch.cuda.Stream()
         self.stage3_inference_stream = torch.cuda.Stream()
-        self.stage4_d2h_stream = torch.cuda.Stream()
+        self.stage4_postprocess_stream = torch.cuda.Stream()
 
         # Keep ring buffers for intermediate outputs
         self.num_overlap = num_overlap
         self.preproc_outputs = [None] * num_overlap
         self.inference_outputs = [None] * num_overlap
-        ## self.pinned_buffers = [None] * num_overlap
-        ## self.stage4_d2h_events = [None] * num_overlap
-        ## self.final_events = [None] * num_overlap
+        self.postprocess_outputs = [None] * num_overlap
 
-        ## # Pre-build a small struct for cupy ops
-        ## self.structure = cp.ones((3, 3), dtype=cp.float32)
+        # Pre-build a small struct for cupy ops
+        self.structure = cp.ones((3, 3), dtype=cp.float32)
 
         # Set up autocast context
         if "cuda" in str(device) and mixed_precision_dtype != torch.float32:
@@ -81,27 +79,40 @@ class InferencePipeline:
                 logits = self.model(preproc_out)
         return logits.softmax(dim=1).argmax(dim=1, keepdim=True)
 
-    def stage4_d2h_copy(self, gpu_tensor):
+    def stage4_postprocess(self, seg_maps):
         """
-        Stage 4: Copy GPU tensor to pinned CPU buffer (pure function,
-        no direct reference to streams or events).
+        Stage 4: label + center_of_mass with CuPy.
+
+        WARNING: This stage requires host-device synchronization which can
+        reduce pipeline performance. It's kept for code clarity and to match
+        the documentation, despite the performance trade-off.
         """
-        # Allocate pinned_buf if not done yet
-        pinned_buf = torch.empty_like(
-            gpu_tensor,
-            device='cpu',  # CPU side
-            pin_memory=True,
-            requires_grad=False
-        )
-        # Asynchronous copy into pinned_buf
-        pinned_buf.copy_(gpu_tensor, non_blocking=True)
-        return pinned_buf
+        B = seg_maps.size(0) // self.P
+        peak_positions = [[] for _ in range(B)]
+
+        cupy_stream = cp.cuda.ExternalStream(ptr=torch.cuda.current_stream().cuda_stream)
+        with cupy_stream.use():
+            for idx, seg_map in enumerate(seg_maps.flatten(0,1)):
+                seg_map_cp = cp.asarray(seg_map, dtype=cp.float32)
+                labeled_map, num_peaks = ndimage.label(seg_map_cp, self.structure)
+                peak_coords = ndimage.center_of_mass(
+                    seg_map_cp,
+                    cp.asarray(labeled_map, dtype=cp.float32),
+                    cp.arange(1, num_peaks + 1)
+                )
+                if len(peak_coords) > 0:
+                    b = idx // self.P
+                    p = idx % self.P
+                    peak_positions[b].extend(
+                        ([p] + peak.tolist()) for peak in peak_coords if len(peak) > 0
+                    )
+        return peak_positions
 
     def process_batch(self, batch_cpu, batch_idx):
         """
         Launch the pipeline stages asynchronously for a single batch,
         storing results in ring buffer slot `buf_idx`.
-        Returns: a torch.cuda.Event that signals completion of stage4_postprocessing.
+        Returns: peak_positions extracted from the segmentation maps.
         """
         buf_idx = batch_idx % self.num_overlap
 
@@ -109,7 +120,7 @@ class InferencePipeline:
         stage1_h2d_done = torch.cuda.Event(enable_timing=False)
         stage2_preprocess_done = torch.cuda.Event(enable_timing=False)
         stage3_inference_done = torch.cuda.Event(enable_timing=False)
-        stage4_d2h_done = torch.cuda.Event(enable_timing=False)
+        stage4_postprocess_done = torch.cuda.Event(enable_timing=False)
 
         # Stage 1: H2D
         with torch.cuda.stream(self.stage1_h2d_stream):
@@ -121,7 +132,6 @@ class InferencePipeline:
         # Stage 2: Preprocess
         with torch.cuda.stream(self.stage2_preprocess_stream):
             self.stage2_preprocess_stream.wait_event(stage1_h2d_done)
-            ## stage1_h2d_done.wait()
             nvtx.range_push("Stage 2: Preprocess")
             preproc_out = self.stage2_preprocess(gpu_batch)
             self.preproc_outputs[buf_idx] = preproc_out
@@ -131,22 +141,22 @@ class InferencePipeline:
         # Stage 3: Inference
         with torch.cuda.stream(self.stage3_inference_stream):
             self.stage3_inference_stream.wait_event(stage2_preprocess_done)
-            ## stage2_preprocess_done.wait()
             nvtx.range_push("Stage 3: Inference")
             inf_out = self.stage3_inference(self.preproc_outputs[buf_idx])
             self.inference_outputs[buf_idx] = inf_out
             stage3_inference_done.record(self.stage3_inference_stream)
             nvtx.range_pop()
 
-        # Stage 4: Async copy GPU->Pinned
-        with torch.cuda.stream(self.stage4_d2h_stream):
-            self.stage4_d2h_stream.wait_event(stage3_inference_done)
-            nvtx.range_push("Stage 4: D2H Copy")
-            pinned_buf = self.stage4_d2h_copy(self.inference_outputs[buf_idx])
-            stage4_d2h_done.record(self.stage4_d2h_stream)
+        # Stage 4: Postprocess (CuPy coordinate extraction)
+        with torch.cuda.stream(self.stage4_postprocess_stream):
+            self.stage4_postprocess_stream.wait_event(stage3_inference_done)
+            nvtx.range_push("Stage 4: Postprocess")
+            final_out = self.stage4_postprocess(self.inference_outputs[buf_idx])
+            self.postprocess_outputs[buf_idx] = final_out
+            stage4_postprocess_done.record(self.stage4_postprocess_stream)
             nvtx.range_pop()
 
-        return pinned_buf, stage4_d2h_done
+        return final_out
 
     def process_batches(self, batches_cpu):
         """
@@ -157,26 +167,24 @@ class InferencePipeline:
         final_events = []
         for i, batch_cpu in enumerate(batches_cpu):
             # Launch the pipeline for each batch
-            ev = self.process_batch(batch_cpu, i)
-            final_events.append((i, ev))
+            peak_positions = self.process_batch(batch_cpu, i)
+            final_events.append((i, peak_positions))
 
-        # Wait for each final event in order, gather results
+        # Gather results
         results = []
-        for i, ev in final_events:
-            ev.synchronize()  # wait for all stages (or last stage) to complete
-            buf_idx = i % self.num_overlap
-            results.append(self.inference_outputs[buf_idx])
+        for i, peak_positions in final_events:
+            results.append(peak_positions)
 
         return results
 
     def process_batches_streaming(self, batches_cpu):
         """
-        Dispatch multiple batches in a streaming manner. We'll store the
-        final Stage 4 event for each batch in a ring buffer. Then we yield
-        results once we must reuse that slot or once all are done.
+        Dispatch multiple batches in a streaming manner, yielding
+        peak positions as they become available.
         """
         batch_count = 0
 
         for batch_cpu in batches_cpu:
-            yield self.process_batch(batch_cpu, batch_count)
+            peak_positions = self.process_batch(batch_cpu, batch_count)
+            yield peak_positions
             batch_count += 1

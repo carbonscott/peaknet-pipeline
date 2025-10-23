@@ -197,8 +197,8 @@ def run_inference(args):
         )
 
         # Create and run the inference pipeline
-        pipeline = InferencePipeline(model, device, mixed_precision_dtype, args.H, args.W, args.enable_timing)
-        pipeline.setup_autocast()
+        pipeline = InferencePipeline(model, device, mixed_precision_dtype, args.H, args.W, args.num_overlap)
+        ## pipeline.setup_autocast()
 
         logging.info("InferencePipeline created, starting inference")
 
@@ -206,15 +206,14 @@ def run_inference(args):
         base_delay = 0.1  # Base delay of 100ms
         max_delay = 2.0   # Maximum delay of 2 seconds
         batch_idx = 0
-        for batch, batch_photon_energy in dataloader:
+
+        for batch_idx, (batch, batch_photon_energy) in enumerate(dataloader):
             if batch.numel() == 0:
                 logging.warning("Received empty batch, skipping")
                 continue
 
-            ## torch.cuda.empty_cache()
-
             logging.info(f"Processing batch {batch_idx} of shape: {batch.shape}")
-            peak_positions = pipeline.process_batch(batch)
+            peak_positions = pipeline.process_batch(batch, batch_idx)
 
             # Accumulate results for the batch
             batch_results = list(zip(batch.cpu().numpy(), peak_positions, batch_photon_energy))
@@ -237,7 +236,6 @@ def run_inference(args):
                         logging.warning(f"Rank {dist_local_rank}, Device {device}: Queue is full, retrying in {total_delay:.2f} seconds...")
                         time.sleep(total_delay)
                         if delay < max_delay: retries += 1
-            batch_idx += 1
 
         if accumulated_results:
             retries = 0
@@ -301,7 +299,7 @@ def main():
                         help="Data type for mixed precision")
     parser.add_argument("--H", type=int, default=512, help="Height of the image in inference")
     parser.add_argument("--W", type=int, default=512, help="Width of the image in inference")
-    parser.add_argument("--enable_timing", action='store_true', help="Enable timing each stage")
+    parser.add_argument("--num_overlap", type=int, default=3, help="Number of overlap tasks")
     parser.add_argument("--accumulation_steps", type=int, default=10, help="Accumulation step before pushing to queue")
     parser.add_argument("--dist_backend", type=str, default="nccl", choices=["nccl", "gloo"],
                         help="Distributed backend to use")
